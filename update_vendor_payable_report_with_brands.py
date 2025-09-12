@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Tuple, Dict, Any
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.styles import Font, PatternFill
+
 
 
 def load_latest_ap_analysis(dir_path: str | Path) -> tuple[pd.DataFrame, Path]:
@@ -90,12 +92,12 @@ def filter_ap_analysis(
     merch_col: str = "merchType",
     category_col: str = "Category",
     keep_merch_value: str = "Merch",
-    keep_category_value: str = "Home Services",
+    keep_category_value: str = "Home Services",  # kept for signature compatibility; not used directly
 ) -> pd.DataFrame:
-    """Apply all AP Analysis filters and return a new DataFrame."""
+    """Apply AP Analysis filters; consolidate categories to 'Brands & Retail' or 'Home Services' then keep only those two."""
     out = df.copy()
 
-    # --- Amount to numeric ---
+    # --- Amount to numeric (robust) ---
     if amount_col not in out.columns:
         raise KeyError(f"Expected column '{amount_col}' not found")
     amt = (
@@ -113,18 +115,38 @@ def filter_ap_analysis(
         raise KeyError(f"Expected column '{merch_col}' not found")
     out = out[out[merch_col].fillna("").eq(keep_merch_value)]
 
-    # --- Category in {'Home Services', 'Brands & Retail'} (case/whitespace tolerant) ---
+    # --- Consolidate Category ---
     if category_col not in out.columns:
         raise KeyError(f"Expected column '{category_col}' not found")
-    cat_norm = (
-        out[category_col]
-        .fillna("")
-        .str.strip()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.casefold()
-    )
-    allowed = {keep_category_value.casefold(), "brands & retail"}
-    out = out[cat_norm.isin(allowed)]
+
+    # normalize helper
+    _norm = lambda s: re.sub(r"\s+", " ", str(s).strip()).casefold()
+
+    # categories that should map to 'Brands & Retail'
+    brands_like = {
+        "a",
+        "brands",
+        "guam",
+        "parts supply chain",
+        "parts/brands",
+        "parts/retail/brands",
+        "retail merchandise",
+        "retail",
+    }
+
+    cat_norm = out[category_col].map(_norm)
+
+    # start with 'Other', then assign two buckets
+    consolidated = pd.Series("Other", index=out.index)
+    consolidated = consolidated.mask(cat_norm.eq("home services"), "Home Services")
+    consolidated = consolidated.mask(cat_norm.isin(brands_like), "Brands & Retail")
+
+    # overwrite Category with consolidated label
+    out[category_col] = consolidated
+
+    # --- Keep only 'Home Services' and 'Brands & Retail' ---
+    allowed = {"home services", "brands & retail"}
+    out = out[out[category_col].str.casefold().isin(allowed)]
 
     return out
 
@@ -262,34 +284,13 @@ def insert_aggregate_into_listings(
     *,
     sheet_name: str = "Listings",
 ) -> Tuple[str, int]:
-    """
-    Insert df_aggregate_vendor_data into the 'Listings' sheet by adding 5 columns
-    (Accrued Purchases, Adjustments, Bill, Payment, Period X- Week Y) immediately
-    before 'Net Change', then filling values by matching on Vendor (column B).
+    """Insert df_aggregate_vendor_data into 'Listings' by adding 5 columns before 'Net Change' and filling values."""
+    import re
+    import datetime
+    from typing import Any, Dict
+    from openpyxl.worksheet.worksheet import Worksheet
+    from openpyxl.styles import Font, PatternFill
 
-    Period number is computed as (current month - 1) with wrap-around (Jan -> 12).
-    Week number is computed as (previous week + 1) from the latest Period column.
-
-    The newly inserted 'Period X- Week Y' value = previous Period value
-        + Accrued Purchases + Adjustments + Bill + Payment
-
-    The newly calculated 'Net Change' = previous Period value - new Period value
-    (i.e., per user instruction).
-
-    Args:
-        wb (Workbook): An *editable* openpyxl workbook (read_only must be False).
-        df_aggregate_vendor_data (pd.DataFrame): Must contain columns:
-            ['Vendor', 'Division', 'Accrued Purchases', 'Adjustments', 'Bill', 'Payment'].
-        sheet_name (str, optional): Target worksheet name. Defaults to 'Listings'.
-
-    Returns:
-        Tuple[str, int]: (inserted_period_header, number_of_rows_updated)
-
-    Raises:
-        KeyError: If required columns are missing in either the sheet or dataframe.
-        ValueError: If required headers like 'Net Change' or any 'Period X- Week Y'
-                    columns cannot be found.
-    """
     # --- 0. Validate inputs ---
     required_df_cols = {
         "Vendor", "Division", "Accrued Purchases", "Adjustments", "Bill", "Payment"
@@ -302,25 +303,23 @@ def insert_aggregate_into_listings(
         raise KeyError(f"Worksheet '{sheet_name}' not found in workbook.")
     ws: Worksheet = wb[sheet_name]
 
-    # --- 1. Read header row (assumes header is in row 1, A1='Division') ---
+    # --- 1. Read header row (assumes A1 == 'Division') ---
     headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
     if not headers or headers[0] != "Division":
         raise KeyError("Expected 'Division' in A1 of the Listings sheet.")
 
-    # Helper to match "Period X- Week Y"
     period_re = re.compile(r"^\s*Period\s+(\d+)\s*-\s*Week\s+(\d+)\s*$", re.I)
 
-    # --- 2. Find the 'Net Change' column and the last Period column before it ---
+    # --- 2. Find 'Net Change' and last Period column before it ---
     try:
-        net_change_idx_1based = headers.index("Net Change") + 1  # 1-based
+        net_change_idx_1based = headers.index("Net Change") + 1
     except ValueError as e:
         raise ValueError("Could not find 'Net Change' header in the Listings sheet.") from e
 
     last_period_idx_1based = None
     last_period_label = None
     last_period_week = None
-
-    for c in range(1, net_change_idx_1based):  # strictly before 'Net Change'
+    for c in range(1, net_change_idx_1based):
         h = headers[c - 1]
         if isinstance(h, str):
             m = period_re.match(h)
@@ -334,19 +333,16 @@ def insert_aggregate_into_listings(
 
     # --- 3. Determine new Period and Week labels ---
     today = datetime.date.today()
-    # Period = current month - 1 (wrap Jan->Dec)
-    period_num = ((today.month - 2) % 12) + 1
+    period_num = ((today.month - 2) % 12) + 1  # current_month - 1, wrap Jan->Dec
     new_week_num = (last_period_week or 0) + 1
     new_period_label = f"Period {period_num}- Week {new_week_num}"
 
     # --- 4. Insert 5 columns immediately BEFORE 'Net Change' ---
-    # After insertion: newly inserted columns occupy [net_change_idx_1based .. +4]
     ws.insert_cols(net_change_idx_1based, amount=5)
-
     col_accrued = net_change_idx_1based
     col_adjust = net_change_idx_1based + 1
-    col_bill = net_change_idx_1based + 2
-    col_pay = net_change_idx_1based + 3
+    col_bill   = net_change_idx_1based + 2
+    col_pay    = net_change_idx_1based + 3
     col_new_period = net_change_idx_1based + 4
     col_net_change = net_change_idx_1based + 5  # 'Net Change' shifts right by 5
 
@@ -357,11 +353,15 @@ def insert_aggregate_into_listings(
     ws.cell(row=1, column=col_pay,        value="Payment")
     ws.cell(row=1, column=col_new_period, value=new_period_label)
 
+    # --- Header fill: make ALL headers in row 1 light green ---
+    header_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE", end_color="FFC6EFCE")
+    for c in range(1, ws.max_column + 1):
+        ws.cell(row=1, column=c).fill = header_fill
+
     # --- 5. Build a vendor lookup from the df (robust, normalized) ---
     def _norm_vendor(s: Any) -> str:
         return re.sub(r"\s+", " ", str(s).strip()).casefold()
 
-    # Ensure numeric dtype for sums
     flows = df_aggregate_vendor_data.copy()
     for col in ["Accrued Purchases", "Adjustments", "Bill", "Payment"]:
         flows[col] = pd.to_numeric(flows[col], errors="coerce").fillna(0.0)
@@ -373,7 +373,7 @@ def insert_aggregate_into_listings(
         .to_dict(orient="index")
     )
 
-    # --- 6. Helpers for numeric conversion from sheet cells ---
+    # --- 6. Helpers ---
     def _to_float(v) -> float:
         if v is None:
             return 0.0
@@ -383,7 +383,6 @@ def insert_aggregate_into_listings(
         if not s:
             return 0.0
         s = s.replace(",", "")
-        # Handle parentheses-negatives
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1]
         try:
@@ -391,7 +390,12 @@ def insert_aggregate_into_listings(
         except ValueError:
             return 0.0
 
-    # The previous period column index is unchanged by the insertion we did (we inserted at 'Net Change')
+    def _write_num(row: int, col: int, val: float):
+        cell = ws.cell(row=row, column=col, value=val)
+        cell.number_format = "#,##0.00"
+        if val < 0:
+            cell.font = Font(color="FFFF0000")  # red for negatives
+
     prev_period_col = last_period_idx_1based
 
     # --- 7. Fill values row-by-row using Vendor match in column B ---
@@ -405,32 +409,126 @@ def insert_aggregate_into_listings(
         key = _norm_vendor(vendor_cell)
         data = vendor_map.get(key, None)
 
-        # Pull flows; default to 0.0 if vendor not present in df
         acc_val = data["Accrued Purchases"] if data else 0.0
-        adj_val = data["Adjustments"] if data else 0.0
-        bill_val = data["Bill"] if data else 0.0
-        pay_val = data["Payment"] if data else 0.0
+        adj_val = data["Adjustments"]       if data else 0.0
+        bill_val = data["Bill"]             if data else 0.0
+        pay_val = data["Payment"]           if data else 0.0
 
-        # Previous period cumulative value
         prev_period_val = _to_float(ws.cell(row=r, column=prev_period_col).value)
-
-        # New period cumulative = previous + flows
         new_period_val = prev_period_val + acc_val + adj_val + bill_val + pay_val
 
-        # Net Change = new - previous
+        # Net Change = new - previous (per latest instruction)
         net_change_val = new_period_val - prev_period_val
 
-        # Write values
-        ws.cell(row=r, column=col_accrued,    value=acc_val).number_format = "#,##0.00"
-        ws.cell(row=r, column=col_adjust,     value=adj_val).number_format = "#,##0.00"
-        ws.cell(row=r, column=col_bill,       value=bill_val).number_format = "#,##0.00"
-        ws.cell(row=r, column=col_pay,        value=pay_val).number_format = "#,##0.00"
-        ws.cell(row=r, column=col_new_period, value=new_period_val).number_format = "#,##0.00"
-        ws.cell(row=r, column=col_net_change, value=net_change_val).number_format = "#,##0.00"
+        _write_num(r, col_accrued,    acc_val)
+        _write_num(r, col_adjust,     adj_val)
+        _write_num(r, col_bill,       bill_val)
+        _write_num(r, col_pay,        pay_val)
+        _write_num(r, col_new_period, new_period_val)
+        _write_num(r, col_net_change, net_change_val)
 
         updated_rows += 1
 
     return new_period_label, updated_rows
+
+def extend_totals_rows(
+    wb: Workbook,
+    *,
+    sheet_name: str = "Listings",
+) -> tuple[int, int, int]:
+    """
+    Find the two Totals rows (Home Services and Brands & Retail) and extend their totals
+    across all data columns. Totals are SUMs of the rows above:
+      - Home Services totals: sum from row 2 through the row above its Totals row.
+      - Brands & Retail totals: sum from the row after the Home Services totals row
+        through the row above the Brands & Retail totals row.
+
+    Also styles both Totals rows: light blue fill (#BCBEF7) and bold text.
+
+    Returns:
+        (home_services_row, brands_retail_row, num_columns_updated)
+    """
+    import re
+    from typing import Optional
+    from openpyxl.worksheet.worksheet import Worksheet
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    if sheet_name not in wb.sheetnames:
+        raise KeyError(f"Worksheet '{sheet_name}' not found in workbook.")
+    ws: Worksheet = wb[sheet_name]
+
+    # Basic sanity: expect headers on row 1 with A1 == "Division" and B1 == "Vendor"
+    if ws.cell(1, 1).value != "Division" or ws.cell(1, 2).value != "Vendor":
+        raise KeyError("Expected headers in row 1 with A1='Division' and B1='Vendor'.")
+
+    max_col = ws.max_column
+    max_row = ws.max_row
+
+    def _norm(s: Optional[str]) -> str:
+        return re.sub(r"\s+", " ", str(s or "").strip()).casefold()
+
+    # Locate Totals rows by Division="Totals" and Vendor matching the bucket name
+    hs_row = None
+    br_row = None
+    for r in range(2, max_row + 1):
+        div = _norm(ws.cell(r, 1).value)  # Column A
+        ven = _norm(ws.cell(r, 2).value)  # Column B
+        if div == "totals" and ven == "home services":
+            hs_row = r
+        elif div == "totals" and ven == "brands & retail":
+            br_row = r
+
+    if hs_row is None:
+        raise ValueError("Could not find Home Services Totals row (Division='Totals', Vendor='Home Services').")
+    if br_row is None:
+        raise ValueError("Could not find Brands & Retail Totals row (Division='Totals', Vendor='Brands & Retail').")
+    if not (2 < hs_row < br_row):
+        raise ValueError(f"Unexpected Totals layout: Home Services row {hs_row}, Brands & Retail row {br_row}.")
+
+    # Styling for Totals rows
+    totals_fill = PatternFill(fill_type="solid", start_color="FFBCBEF7", end_color="FFBCBEF7")
+    totals_font = Font(bold=True)
+
+    # Helper to set SUM formula or 0 when the range would be empty
+    def _set_sum_or_zero(row: int, col: int, start_row: int, end_row: int):
+        cell = ws.cell(row=row, column=col)
+        if start_row <= end_row:
+            col_letter = get_column_letter(col)
+            cell.value = f"=SUM({col_letter}{start_row}:{col_letter}{end_row})"
+        else:
+            cell.value = 0
+        cell.number_format = "#,##0.00"
+
+    # Update totals for every *data* column (from column 3 onward).
+    # Skip obviously non-numeric columns like "Notes".
+    num_cols_updated = 0
+    for c in range(3, max_col + 1):
+        header_val = ws.cell(1, c).value
+        if header_val is None or str(header_val).strip() == "":
+            continue
+        if isinstance(header_val, str) and _norm(header_val) == "notes":
+            continue
+
+        # Home Services Totals: sum rows 2 .. hs_row-1
+        _set_sum_or_zero(hs_row, c, 2, hs_row - 1)
+
+        # Brands & Retail Totals: sum rows hs_row+1 .. br_row-1
+        _set_sum_or_zero(br_row, c, hs_row + 1, br_row - 1)
+
+        num_cols_updated += 1
+
+    # Style both totals rows across all columns with fill + bold
+    for c in range(1, max_col + 1):
+        cell_hs = ws.cell(hs_row, c)
+        cell_br = ws.cell(br_row, c)
+        cell_hs.fill = totals_fill
+        cell_br.fill = totals_fill
+        cell_hs.font = totals_font
+        cell_br.font = totals_font
+
+    return hs_row, br_row, num_cols_updated
+
 
 # ONLY FOR DEBUGGING PURPOSES
 def _normalize_for_debug(df, date_col="Date", amount_col="Amount", account_col="Account", type_col="Type"):
@@ -506,14 +604,21 @@ if __name__ == "__main__":
     )
     print(f"Inserted columns through '{new_period_header}'. Updated {n_rows} rows.")
 
-    # --- 9. Save & close workbook ---
+    # --- 9. Extend the Totals rows (Home Services & Brands & Retail) ---
+    hs_row, br_row, num_cols = extend_totals_rows(
+        xl_vendor_payable_report, sheet_name="Listings"
+    )
+    print(f"Extended totals rows (HS row {hs_row}, BR row {br_row}) across {num_cols} columns.")
+
+    # --- 10. Save & close workbook ---
     xl_vendor_payable_report.save(VENDOR_DIR)
     xl_vendor_payable_report.close()
     print("Saved and closed workbook.")
 
-    # --- 10. Report elapsed time ---
+    # --- 11. Report elapsed time ---
     t1 = time.perf_counter()
     print(f"Done in {t1 - t0:.2f}s")
+
 
 
 
