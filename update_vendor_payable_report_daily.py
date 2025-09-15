@@ -7,10 +7,11 @@ import zipfile
 from openpyxl import load_workbook
 from pathlib import Path
 from typing import Tuple, Dict, Any
+from typing import Optional
 from openpyxl.workbook import Workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.styles import Font, PatternFill
-
+from openpyxl.utils import get_column_letter
 
 
 def load_latest_ap_analysis(dir_path: str | Path) -> tuple[pd.DataFrame, Path]:
@@ -448,11 +449,6 @@ def extend_totals_rows(
     Returns:
         (home_services_row, brands_retail_row, num_columns_updated)
     """
-    import re
-    from typing import Optional
-    from openpyxl.worksheet.worksheet import Worksheet
-    from openpyxl.styles import Font, PatternFill
-    from openpyxl.utils import get_column_letter
 
     if sheet_name not in wb.sheetnames:
         raise KeyError(f"Worksheet '{sheet_name}' not found in workbook.")
@@ -529,31 +525,193 @@ def extend_totals_rows(
 
     return hs_row, br_row, num_cols_updated
 
+def _find_latest_period_and_flow_cols(ws: Worksheet) -> tuple[int, list[int]]:
+    """Return (latest 'Period X- Week Y' column index, [Accrued, Adjustments, Bill, Payment] cols just before it)."""
+    import re
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    if not headers or headers[0] != "Division" or headers[1] != "Vendor":
+        raise KeyError("Expected row 1 headers starting with ['Division','Vendor'].")
+    try:
+        net_change_idx = headers.index("Net Change") + 1
+    except ValueError as e:
+        raise ValueError("Could not find 'Net Change' header.") from e
 
-# ONLY FOR DEBUGGING PURPOSES
-def _normalize_for_debug(df, date_col="Date", amount_col="Amount", account_col="Account", type_col="Type"):
-    d = df.copy()
-    d["_date"] = pd.to_datetime(d[date_col], errors="coerce").dt.normalize()
-    amt = (d[amount_col].astype(str).str.strip()
-           .str.replace("$", "", regex=False)
-           .str.replace(",", "", regex=False)
-           .str.replace("(", "-", regex=False)
-           .str.replace(")", "", regex=False))
-    d["_amt"] = pd.to_numeric(amt, errors="coerce").fillna(0.0)
-    acct_code = d[account_col].astype(str).str.extract(r"^\s*(\d{5})", expand=False)
-    d["_acct"] = pd.to_numeric(acct_code, errors="coerce")
-    t = d[type_col].astype(str).str.strip().str.casefold().str.replace(r"\s+", " ", regex=True)
-    d["_type"] = t.replace({
-        "bill": "vendor bill",
-        "vendorbill": "vendor bill",
-        "vendor  bill": "vendor bill",
-        "journal entry": "journal",
-        "itemreceipt": "item receipt",
-        "billpayment": "bill payment",
-        "vendorprepayment": "vendor prepayment",
-        "vendorprepayment application": "vendor prepayment application",
-    }, regex=False)
-    return d
+    period_re = re.compile(r"^\s*Period\s+\d+\s*-\s*Week\s+\d+\s*$", re.I)
+    period_col = None
+    for c in range(1, net_change_idx):
+        h = headers[c - 1]
+        if isinstance(h, str) and period_re.match(h):
+            period_col = c
+    if period_col is None:
+        raise ValueError("Could not locate a 'Period X- Week Y' header before 'Net Change'.")
+
+    flow_cols = [period_col - 4, period_col - 3, period_col - 2, period_col - 1]
+    expected = ["Accrued Purchases", "Adjustments", "Bill", "Payment"]
+    got = [str(headers[i - 1] or "").strip() for i in flow_cols]
+    if [g.casefold() for g in got] != [e.casefold() for e in expected]:
+        raise ValueError(f"Unexpected flow headers before latest Period: {got}")
+    return period_col, flow_cols
+
+def _to_float_cell(ws: Worksheet, r: int, c: int) -> float:
+    """Excel-like parsing: commas, () negatives, blanks -> 0.0"""
+    v = ws.cell(r, c).value
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return 0.0
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+def extract_current_snapshot_from_listings(
+    wb: Workbook, *, sheet_name: str = "Listings"
+) -> pd.DataFrame:
+    """
+    Build a row-level snapshot from Listings with:
+      ['Division','Vendor','Current Balance','Accrued Purchases','Adjustments','Bill','Payment','Net Change']
+    Skips Totals rows and blank vendors.
+    """
+    if sheet_name not in wb.sheetnames:
+        raise KeyError(f"Worksheet '{sheet_name}' not found.")
+    ws: Worksheet = wb[sheet_name]
+
+    period_col, flow_cols = _find_latest_period_and_flow_cols(ws)
+    col_acc, col_adj, col_bill, col_pay = flow_cols
+
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        division = ws.cell(r, 1).value
+        vendor   = ws.cell(r, 2).value
+        if not vendor or str(vendor).strip() == "":
+            continue
+        if isinstance(division, str) and division.strip().casefold() == "totals":
+            continue
+
+        current_balance = _to_float_cell(ws, r, period_col)
+        acc = _to_float_cell(ws, r, col_acc)
+        adj = _to_float_cell(ws, r, col_adj)
+        bill = _to_float_cell(ws, r, col_bill)
+        pay = _to_float_cell(ws, r, col_pay)
+        net_change = acc + adj + bill + pay
+
+        rows.append({
+            "Division": str(division or "").strip(),
+            "Vendor": str(vendor).strip(),
+            "Current Balance": current_balance,
+            "Accrued Purchases": acc,
+            "Adjustments": adj,
+            "Bill": bill,
+            "Payment": pay,
+            "Net Change": net_change,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Division_norm"] = df["Division"].str.strip().str.casefold()
+        df = df[df["Division_norm"].isin({"home services", "brands & retail"})].drop(columns=["Division_norm"])
+    return df
+
+def create_summary_dataframes_from_listings(
+    wb: Workbook, *, sheet_name: str = "Listings", top_n: int = 5
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """
+    Produce four DataFrames (top 5) using only Listings:
+      - Home Services: by Current Balance, by Net Change
+      - Brands & Retail: by Current Balance, by Net Change
+    """
+    snap = extract_current_snapshot_from_listings(wb, sheet_name=sheet_name)
+
+    def _top(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        if df_div.empty:
+            return pd.DataFrame(columns=["Vendor", metric])
+        return (
+            df_div[["Vendor", metric]]
+              .groupby("Vendor", as_index=False)[metric].sum()
+              .sort_values(metric, ascending=False, kind="mergesort")
+              .head(top_n)
+              .reset_index(drop=True)
+        )
+
+    out: dict[str, dict[str, pd.DataFrame]] = {}
+    for div in ["Home Services", "Brands & Retail"]:
+        sub = snap[snap["Division"].str.strip().eq(div)]
+        out[div] = {
+            "top_by_current_balance": _top(sub, "Current Balance"),
+            "top_by_net_change": _top(sub, "Net Change"),
+        }
+    return out
+
+def write_summaries_to_sheet(
+    wb: Workbook,
+    summaries: dict[str, dict[str, pd.DataFrame]],
+    *,
+    sheet_name: str = "Summary",
+    start_date=None,
+    end_date=None,
+) -> None:
+    """Create/overwrite 'Summary' as the FIRST sheet, add a week banner, and write four tables with light-green headers."""
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.utils import get_column_letter
+    import pandas as pd
+
+    # Delete existing Summary (if any), then create it at index 0 (first sheet)
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(title=sheet_name, index=0)
+
+    header_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE", end_color="FFC6EFCE")
+    header_font = Font(bold=True)
+
+    # Optional banner "Week START_DATE to END_DATE" at the top
+    row_cursor = 1
+    if start_date is not None and end_date is not None:
+        def _fmt(d):
+            try:
+                return pd.to_datetime(d).date().isoformat()
+            except Exception:
+                return str(d)
+        banner = f"Week {_fmt(start_date)} to {_fmt(end_date)}"
+        ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=2)
+        cell = ws.cell(row_cursor, 1, banner)
+        cell.font = Font(bold=True, size=12)
+        row_cursor += 2  # leave a blank row after the banner
+
+    def _write_table(start_row: int, title: str, df: pd.DataFrame) -> int:
+        r = start_row
+        ws.cell(r, 1, title).font = Font(bold=True)
+        r += 1
+        # headers
+        ws.cell(r, 1, "Vendor").fill = header_fill; ws.cell(r, 1).font = header_font
+        metric_name = df.columns[1] if len(df.columns) > 1 else "Value"
+        ws.cell(r, 2, metric_name).fill = header_fill; ws.cell(r, 2).font = header_font
+        r += 1
+        # rows
+        for _, row in df.iterrows():
+            ws.cell(r, 1, row["Vendor"])
+            val = float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0.0
+            cell = ws.cell(r, 2, val)
+            cell.number_format = "#,##0.00"
+            r += 1
+        # quick autosize
+        for c in (1, 2):
+            width = max(len(str(ws.cell(start_row + 1, c).value or "")), 12)
+            for rr in range(start_row + 2, r):
+                width = max(width, len(str(ws.cell(rr, c).value or "")))
+            ws.column_dimensions[get_column_letter(c)].width = min(width + 2, 50)
+        return r + 1  # blank row spacer
+
+    r = row_cursor
+    r = _write_table(r, "Home Services — Top 5 by Current Balance", summaries["Home Services"]["top_by_current_balance"])
+    r = _write_table(r, "Home Services — Top 5 by Net Change", summaries["Home Services"]["top_by_net_change"])
+    r = _write_table(r, "Brands & Retail — Top 5 by Current Balance", summaries["Brands & Retail"]["top_by_current_balance"])
+    _ = _write_table(r, "Brands & Retail — Top 5 by Net Change", summaries["Brands & Retail"]["top_by_net_change"])
+
 
 
 if __name__ == "__main__":
@@ -610,6 +768,19 @@ if __name__ == "__main__":
     )
     print(f"Extended totals rows (HS row {hs_row}, BR row {br_row}) across {num_cols} columns.")
 
+    # --- 9b. Build and write summary tables (from Listings only) ---
+    summaries = create_summary_dataframes_from_listings(
+        xl_vendor_payable_report, sheet_name="Listings", top_n=5
+    )
+    write_summaries_to_sheet(
+        xl_vendor_payable_report,
+        summaries,
+        sheet_name="Weekly Summary",
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+    print("Wrote Summary sheet with top-5 tables for both divisions.")
+
     # --- 10. Save & close workbook ---
     xl_vendor_payable_report.save(VENDOR_DIR)
     xl_vendor_payable_report.close()
@@ -618,46 +789,3 @@ if __name__ == "__main__":
     # --- 11. Report elapsed time ---
     t1 = time.perf_counter()
     print(f"Done in {t1 - t0:.2f}s")
-
-
-
-
-    # JUST SOME DEBUGGING CODE BELOW HERE
-    # dbg = _normalize_for_debug(df_ap_analysis_report)
-
-    # BILL_ACCTS = {21142, 21110, 21117}
-    # ACCRUED_ACCTS = {21109, 21142}
-    # BILL_TYPES = {"vendor bill", "bill credit", "vendor credit", "journal"}
-    # ACCRUED_TYPES = {"vendor bill", "bill credit", "item receipt"}
-    # PAY_ACCTS = {13150, 21110, 21117}
-    # PAY_TYPES  = {"bill payment", "vendor prepayment", "vendor prepayment application"}
-
-    # bill_like = dbg[dbg["_acct"].isin(BILL_ACCTS) & dbg["_type"].isin(BILL_TYPES)]
-    # print("Bill-like rows (by rule):", len(bill_like), " Sum:", bill_like["_amt"].sum())
-
-    # print("\nBreakdown of what is counting as Bill by _type:")
-    # print(bill_like.groupby("_type")["_amt"].sum().sort_values(ascending=False))
-
-    # print("\nHow much of Bill is actually journals?")
-    # print(bill_like[bill_like["_type"]=="journal"]["_amt"].sum())
-
-    # print("\nAny 'credit memo' rows that might be missing?")
-    # credit_memo = dbg[dbg["_type"]=="credit memo"]
-    # print(len(credit_memo), credit_memo["_amt"].sum())
-
-    # print("\nRows with missing _acct (can’t classify):")
-    # na_acct = dbg[dbg["_acct"].isna()]
-    # print(len(na_acct), na_acct["_amt"].sum())
-    # print("Top 10 raw Account strings for _acct NaN:")
-    # print(na_acct["Account"].astype(str).value_counts().head(10))
-
-    # pay_mask     = dbg["_acct"].isin(PAY_ACCTS)     & dbg["_type"].isin(PAY_TYPES)
-    # accrued_mask = dbg["_acct"].isin(ACCRUED_ACCTS) & dbg["_type"].isin(ACCRUED_TYPES)
-    # bill_mask    = dbg["_acct"].isin(BILL_ACCTS)    & dbg["_type"].isin(BILL_TYPES)
-
-    # # Final Bill = bill_mask AND NOT pay_mask AND NOT accrued_mask  (matches your precedence)
-    # final_bill = dbg[bill_mask & ~pay_mask & ~accrued_mask]
-
-    # print("FINAL Bill rows (after precedence):", len(final_bill), " Sum:", final_bill["_amt"].sum())
-    # print("\nFinal Bill by _type:")
-    # print(final_bill.groupby("_type")["_amt"].sum().sort_values())
