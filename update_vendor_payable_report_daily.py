@@ -432,6 +432,165 @@ def insert_aggregate_into_listings(
 
     return new_period_label, updated_rows
 
+def insert_daily_aggregate_into_daily_listings(
+    wb: Workbook,
+    df_aggregate_vendor_data: pd.DataFrame,
+    day_date: str | datetime.date | datetime.datetime,
+    *,
+    sheet_name: str = "Daily Listings",
+) -> Tuple[str, int]:
+    """
+    Insert df_aggregate_vendor_data into 'Daily Listings' by adding 5 columns before 'Net Change':
+      Accrued Purchases, Adjustments, Bill, Payment, MM/DD/YYYY (for the specified day).
+    Uses the most-recent prior MM/DD/YYYY column as the base cumulative and adds the day's flows.
+
+    Returns:
+        (new_date_label, rows_updated)
+    """
+    import re
+    from typing import Any, Dict
+    from openpyxl.worksheet.worksheet import Worksheet
+
+    # --- 0. Validate inputs ---
+    required_df_cols = {
+        "Vendor", "Division", "Accrued Purchases", "Adjustments", "Bill", "Payment"
+    }
+    missing_df = required_df_cols - set(df_aggregate_vendor_data.columns)
+    if missing_df:
+        raise KeyError(f"df_aggregate_vendor_data missing columns: {sorted(missing_df)}")
+
+    if sheet_name not in wb.sheetnames:
+        raise KeyError(f"Worksheet '{sheet_name}' not found in workbook.")
+    ws: Worksheet = wb[sheet_name]
+
+    # --- 1. Headers & where 'Net Change' is ---
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    if not headers or headers[0] != "Division":
+        raise KeyError("Expected 'Division' in A1 of the Daily Listings sheet.")
+
+    try:
+        net_change_idx_1based = headers.index("Net Change") + 1
+    except ValueError as e:
+        raise ValueError("Could not find 'Net Change' header in Daily Listings.") from e
+
+    # --- 2. Find the last MM/DD/YYYY header BEFORE Net Change ---
+    date_re = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
+    last_date_idx_1based = None
+    last_date_label = None
+
+    for c in range(1, net_change_idx_1based):
+        h = headers[c - 1]
+        # Normalize header to text for matching even if it's a real date
+        if isinstance(h, (datetime.datetime, datetime.date)):
+            text = h.strftime("%m/%d/%Y")
+        else:
+            text = str(h or "").strip()
+
+        if date_re.match(text):
+            last_date_idx_1based = c
+            last_date_label = text
+
+    if last_date_idx_1based is None:
+        raise ValueError("Could not find any 'MM/DD/YYYY' date column before 'Net Change' on Daily Listings.")
+
+
+    # --- 3. Determine new date header from day_date ---
+    new_date = pd.to_datetime(day_date).date()
+    new_date_label = new_date.strftime("%m/%d/%Y")
+
+    # --- 4. Insert 5 columns BEFORE 'Net Change' ---
+    ws.insert_cols(net_change_idx_1based, amount=5)
+    col_accrued     = net_change_idx_1based
+    col_adjust      = net_change_idx_1based + 1
+    col_bill        = net_change_idx_1based + 2
+    col_pay         = net_change_idx_1based + 3
+    col_new_date    = net_change_idx_1based + 4
+    col_net_change  = net_change_idx_1based + 5  # 'Net Change' shifts right by 5
+
+    # Set headers for the new columns
+    ws.cell(1, col_accrued,  "Accrued Purchases")
+    ws.cell(1, col_adjust,   "Adjustments")
+    ws.cell(1, col_bill,     "Bill")
+    ws.cell(1, col_pay,      "Payment")
+    hdr = ws.cell(1, col_new_date, new_date)  # write a real date
+    hdr.number_format = "m/d/yyyy"
+
+
+    # Header fill: make ALL headers light green
+    header_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE", end_color="FFC6EFCE")
+    for c in range(1, ws.max_column + 1):
+        ws.cell(1, c).fill = header_fill
+
+    # --- 5. Build vendor lookup from the df (normalized names) ---
+    def _norm_vendor(s: Any) -> str:
+        return re.sub(r"\s+", " ", str(s).strip()).casefold()
+
+    flows = df_aggregate_vendor_data.copy()
+    for col in ["Accrued Purchases", "Adjustments", "Bill", "Payment"]:
+        flows[col] = pd.to_numeric(flows[col], errors="coerce").fillna(0.0)
+
+    vendor_map: Dict[str, Dict[str, float]] = (
+        flows.set_index(flows["Vendor"].map(_norm_vendor))[["Accrued Purchases", "Adjustments", "Bill", "Payment"]]
+             .to_dict(orient="index")
+    )
+
+    # --- 6. Helpers ---
+    def _to_float(v) -> float:
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace(",", "")
+        if not s:
+            return 0.0
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    def _write_num(row: int, col: int, val: float):
+        cell = ws.cell(row=row, column=col, value=val)
+        cell.number_format = "#,##0.00"
+        if val < 0:
+            cell.font = Font(color="FFFF0000")  # red for negatives
+
+    prev_date_col = last_date_idx_1based
+
+    # --- 7. Fill values row-by-row using Vendor in column B ---
+    updated_rows = 0
+    max_row = ws.max_row
+    for r in range(2, max_row + 1):
+        vendor_cell = ws.cell(r, 2).value
+        if vendor_cell is None or str(vendor_cell).strip() == "":
+            continue
+
+        key = _norm_vendor(vendor_cell)
+        data = vendor_map.get(key)
+
+        acc_val  = data["Accrued Purchases"] if data else 0.0
+        adj_val  = data["Adjustments"]       if data else 0.0
+        bill_val = data["Bill"]              if data else 0.0
+        pay_val  = data["Payment"]           if data else 0.0
+
+        prev_val = _to_float(ws.cell(r, prev_date_col).value)
+        new_val  = prev_val + acc_val + adj_val + bill_val + pay_val
+
+        # Net Change = new - previous (same convention as weekly)
+        net_chg = new_val - prev_val
+
+        _write_num(r, col_accrued,  acc_val)
+        _write_num(r, col_adjust,   adj_val)
+        _write_num(r, col_bill,     bill_val)
+        _write_num(r, col_pay,      pay_val)
+        _write_num(r, col_new_date, new_val)
+        _write_num(r, col_net_change, net_chg)
+
+        updated_rows += 1
+
+    return new_date_label, updated_rows
+
 def extend_totals_rows(
     wb: Workbook,
     *,
@@ -552,6 +711,39 @@ def _find_latest_period_and_flow_cols(ws: Worksheet) -> tuple[int, list[int]]:
         raise ValueError(f"Unexpected flow headers before latest Period: {got}")
     return period_col, flow_cols
 
+def _find_latest_date_and_flow_cols(ws: Worksheet) -> tuple[int, list[int]]:
+    """Return (latest 'MM/DD/YYYY' col index, [Accrued, Adjustments, Bill, Payment] cols just before it)."""
+    import re
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    if not headers or headers[0] != "Division" or headers[1] != "Vendor":
+        raise KeyError("Expected row 1 headers starting with ['Division','Vendor'].")
+
+    try:
+        net_change_idx = headers.index("Net Change") + 1
+    except ValueError as e:
+        raise ValueError("Could not find 'Net Change' header.") from e
+
+    date_re = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
+    date_col = None
+    # scan up to (but not including) Net Change
+    for c in range(1, net_change_idx):
+        h = headers[c - 1]
+        if isinstance(h, (datetime.datetime, datetime.date)):
+            text = h.strftime("%m/%d/%Y")
+        else:
+            text = str(h or "").strip()
+        if date_re.match(text):
+            date_col = c
+    if date_col is None:
+        raise ValueError("Could not locate a 'MM/DD/YYYY' header before 'Net Change'.")
+
+    flow_cols = [date_col - 4, date_col - 3, date_col - 2, date_col - 1]
+    expected = ["Accrued Purchases", "Adjustments", "Bill", "Payment"]
+    got = [str(headers[i - 1] or "").strip() for i in flow_cols]
+    if [g.casefold() for g in got] != [e.casefold() for e in expected]:
+        raise ValueError(f"Unexpected flow headers before latest date: {got}")
+    return date_col, flow_cols
+
 def _to_float_cell(ws: Worksheet, r: int, c: int) -> float:
     """Excel-like parsing: commas, () negatives, blanks -> 0.0"""
     v = ws.cell(r, c).value
@@ -617,33 +809,153 @@ def extract_current_snapshot_from_listings(
         df = df[df["Division_norm"].isin({"home services", "brands & retail"})].drop(columns=["Division_norm"])
     return df
 
+def extract_current_snapshot_from_daily_listings(
+    wb: Workbook, *, sheet_name: str = "Daily Listings"
+) -> pd.DataFrame:
+    """
+    Build a snapshot from Daily Listings with:
+      ['Division','Vendor','Current Balance','Accrued Purchases','Adjustments','Bill','Payment','Net Change']
+    Skips Totals rows and blank vendors.
+    """
+    if sheet_name not in wb.sheetnames:
+        raise KeyError(f"Worksheet '{sheet_name}' not found.")
+    ws: Worksheet = wb[sheet_name]
+
+    date_col, flow_cols = _find_latest_date_and_flow_cols(ws)
+    col_acc, col_adj, col_bill, col_pay = flow_cols
+
+    def _to_float_cell(r: int, c: int) -> float:
+        v = ws.cell(r, c).value
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace(",", "")
+        if not s:
+            return 0.0
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    rows = []
+    for r in range(2, ws.max_row + 1):
+        division = ws.cell(r, 1).value
+        vendor   = ws.cell(r, 2).value
+        if not vendor or str(vendor).strip() == "":
+            continue
+        if isinstance(division, str) and division.strip().casefold() == "totals":
+            continue
+
+        current_balance = _to_float_cell(r, date_col)
+        acc = _to_float_cell(r, col_acc)
+        adj = _to_float_cell(r, col_adj)
+        bill = _to_float_cell(r, col_bill)
+        pay = _to_float_cell(r, col_pay)
+        net_change = acc + adj + bill + pay
+
+        rows.append({
+            "Division": str(division or "").strip(),
+            "Vendor": str(vendor).strip(),
+            "Current Balance": current_balance,
+            "Accrued Purchases": acc,
+            "Adjustments": adj,
+            "Bill": bill,
+            "Payment": pay,
+            "Net Change": net_change,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["Division_norm"] = df["Division"].str.strip().str.casefold()
+        df = df[df["Division_norm"].isin({"home services", "brands & retail"})].drop(columns=["Division_norm"])
+    return df
+
 def create_summary_dataframes_from_listings(
     wb: Workbook, *, sheet_name: str = "Listings", top_n: int = 5
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
-    Produce four DataFrames (top 5) using only Listings:
-      - Home Services: by Current Balance, by Net Change
-      - Brands & Retail: by Current Balance, by Net Change
+    Build summary DataFrames from the weekly 'Listings' sheet:
+      - For each Division in {'Home Services','Brands & Retail'}:
+          * top_by_current_balance
+          * bottom_by_current_balance
+          * top_by_net_change
+          * bottom_by_net_change
     """
     snap = extract_current_snapshot_from_listings(wb, sheet_name=sheet_name)
 
-    def _top(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+    def _agg(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
         if df_div.empty:
             return pd.DataFrame(columns=["Vendor", metric])
         return (
             df_div[["Vendor", metric]]
               .groupby("Vendor", as_index=False)[metric].sum()
-              .sort_values(metric, ascending=False, kind="mergesort")
-              .head(top_n)
-              .reset_index(drop=True)
         )
+
+    def _top(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        agg = _agg(df_div, metric)
+        if agg.empty:
+            return agg
+        return agg.sort_values(metric, ascending=False, kind="mergesort").head(top_n).reset_index(drop=True)
+
+    def _bottom(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        agg = _agg(df_div, metric)
+        if agg.empty:
+            return agg
+        # Ascending: most negative / smallest first (includes negatives)
+        return agg.sort_values(metric, ascending=True, kind="mergesort").head(top_n).reset_index(drop=True)
 
     out: dict[str, dict[str, pd.DataFrame]] = {}
     for div in ["Home Services", "Brands & Retail"]:
         sub = snap[snap["Division"].str.strip().eq(div)]
         out[div] = {
-            "top_by_current_balance": _top(sub, "Current Balance"),
-            "top_by_net_change": _top(sub, "Net Change"),
+            "top_by_current_balance":    _top(sub, "Current Balance"),
+            "bottom_by_current_balance": _bottom(sub, "Current Balance"),
+            "top_by_net_change":         _top(sub, "Net Change"),
+            "bottom_by_net_change":      _bottom(sub, "Net Change"),
+        }
+    return out
+
+def create_daily_summary_dataframes_from_daily_listings(
+    wb: Workbook, *, sheet_name: str = "Daily Listings", top_n: int = 5
+) -> dict[str, dict[str, pd.DataFrame]]:
+    """
+    Build summary DataFrames from the daily 'Daily Listings' sheet:
+      - For each Division in {'Home Services','Brands & Retail'}:
+          * top_by_current_balance
+          * bottom_by_current_balance
+          * top_by_net_change
+          * bottom_by_net_change
+    """
+    snap = extract_current_snapshot_from_daily_listings(wb, sheet_name=sheet_name)
+
+    def _agg(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        if df_div.empty:
+            return pd.DataFrame(columns=["Vendor", metric])
+        return df_div[["Vendor", metric]].groupby("Vendor", as_index=False)[metric].sum()
+
+    def _top(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        agg = _agg(df_div, metric)
+        if agg.empty:
+            return agg
+        return agg.sort_values(metric, ascending=False, kind="mergesort").head(top_n).reset_index(drop=True)
+
+    def _bottom(df_div: pd.DataFrame, metric: str) -> pd.DataFrame:
+        agg = _agg(df_div, metric)
+        if agg.empty:
+            return agg
+        return agg.sort_values(metric, ascending=True, kind="mergesort").head(top_n).reset_index(drop=True)
+
+    out: dict[str, dict[str, pd.DataFrame]] = {}
+    for div in ["Home Services", "Brands & Retail"]:
+        sub = snap[snap["Division"].str.strip().eq(div)]
+        out[div] = {
+            "top_by_current_balance":    _top(sub, "Current Balance"),
+            "bottom_by_current_balance": _bottom(sub, "Current Balance"),
+            "top_by_net_change":         _top(sub, "Net Change"),
+            "bottom_by_net_change":      _bottom(sub, "Net Change"),
         }
     return out
 
@@ -655,12 +967,46 @@ def write_summaries_to_sheet(
     start_date=None,
     end_date=None,
 ) -> None:
-    """Create/overwrite 'Summary' as the FIRST sheet, add a week banner, and write four tables with light-green headers."""
+    """
+    Create/overwrite `sheet_name` as the FIRST worksheet, add a Day/Week banner,
+    and write paired Top/Bottom summary tables side-by-side with one blank column
+    of padding between them.
+
+    Input `summaries` structure (per Division):
+        {
+          "Home Services": {
+            "top_by_current_balance":    DataFrame[Vendor, Current Balance],
+            "bottom_by_current_balance": DataFrame[Vendor, Current Balance],
+            "top_by_net_change":         DataFrame[Vendor, Net Change],
+            "bottom_by_net_change":      DataFrame[Vendor, Net Change],
+          },
+          "Brands & Retail": { ...same keys... }
+        }
+
+    Layout:
+      - Each pair is written starting at the current row.
+      - LEFT table uses columns 1-2 (Vendor, Metric).
+      - Column 3 is left blank as padding.
+      - RIGHT table uses columns 4-5 (Vendor, Metric).
+      - Numeric cells are formatted "#,##0.00".
+      - Header cells use a light-green fill and bold font.
+      - Columns are auto-sized per table.
+
+    Banner:
+      - If start_date and end_date are provided:
+          * When start_date == end_date: the banner is just "MM/DD/YYYY".
+          * Otherwise: the banner is "Week MM/DD/YYYY to MM/DD/YYYY".
+      - The banner spans columns 1-5.
+
+
+    The function deletes any existing sheet with `sheet_name` and recreates it at index 0.
+    """
+
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
     import pandas as pd
 
-    # Delete existing Summary (if any), then create it at index 0 (first sheet)
+    # Recreate sheet at index 0
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
     ws = wb.create_sheet(title=sheet_name, index=0)
@@ -668,50 +1014,96 @@ def write_summaries_to_sheet(
     header_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE", end_color="FFC6EFCE")
     header_font = Font(bold=True)
 
-    # Optional banner "Week START_DATE to END_DATE" at the top
+    # Banner
     row_cursor = 1
     if start_date is not None and end_date is not None:
-        def _fmt(d):
+        def _fmt_us(d):
             try:
-                return pd.to_datetime(d).date().isoformat()
+                return pd.to_datetime(d).strftime("%m/%d/%Y")
             except Exception:
                 return str(d)
-        banner = f"Week {_fmt(start_date)} to {_fmt(end_date)}"
-        ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=2)
+
+        same_day = pd.to_datetime(start_date).date() == pd.to_datetime(end_date).date()
+        # Daily: just the date; Weekly: "Week mm/dd/yyyy to mm/dd/yyyy"
+        banner = _fmt_us(start_date) if same_day else f"Week {_fmt_us(start_date)} to {_fmt_us(end_date)}"
+
+        # Span across both tables (cols 1..5)
+        ws.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=5)
         cell = ws.cell(row_cursor, 1, banner)
         cell.font = Font(bold=True, size=12)
-        row_cursor += 2  # leave a blank row after the banner
+        row_cursor += 2  # blank line after banner
 
-    def _write_table(start_row: int, title: str, df: pd.DataFrame) -> int:
+
+    def _write_table_at(start_row: int, start_col: int, title: str, df: pd.DataFrame) -> int:
+        """Write a 2-col table at (start_row, start_col). Return the last used row."""
         r = start_row
-        ws.cell(r, 1, title).font = Font(bold=True)
+        c1, c2 = start_col, start_col + 1
+
+        # Title
+        ws.cell(r, c1, title).font = Font(bold=True)
         r += 1
-        # headers
-        ws.cell(r, 1, "Vendor").fill = header_fill; ws.cell(r, 1).font = header_font
+
+        # Headers
+        ws.cell(r, c1, "Vendor").fill = header_fill; ws.cell(r, c1).font = header_font
         metric_name = df.columns[1] if len(df.columns) > 1 else "Value"
-        ws.cell(r, 2, metric_name).fill = header_fill; ws.cell(r, 2).font = header_font
+        ws.cell(r, c2, metric_name).fill = header_fill; ws.cell(r, c2).font = header_font
         r += 1
-        # rows
-        for _, row in df.iterrows():
-            ws.cell(r, 1, row["Vendor"])
-            val = float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0.0
-            cell = ws.cell(r, 2, val)
-            cell.number_format = "#,##0.00"
-            r += 1
-        # quick autosize
-        for c in (1, 2):
-            width = max(len(str(ws.cell(start_row + 1, c).value or "")), 12)
+
+        # Rows
+        if not df.empty:
+            for _, row in df.iterrows():
+                ws.cell(r, c1, row["Vendor"])
+                val = float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0.0
+                cell = ws.cell(r, c2, val)
+                cell.number_format = "#,##0.00"
+                r += 1
+
+        # Autosize the two columns for this table
+        for cc in (c1, c2):
+            width = max(len(str(ws.cell(start_row + 1, cc).value or "")), 12)  # header width baseline
             for rr in range(start_row + 2, r):
-                width = max(width, len(str(ws.cell(rr, c).value or "")))
-            ws.column_dimensions[get_column_letter(c)].width = min(width + 2, 50)
-        return r + 1  # blank row spacer
+                width = max(width, len(str(ws.cell(rr, cc).value or "")))
+            ws.column_dimensions[get_column_letter(cc)].width = min(width + 2, 50)
+
+        return r - 1  # last used row
+
+    # Pair writer: left table at col=1, right table at col=4 (one col gap)
+    def _write_pair(start_row: int, left_title: str, left_df: pd.DataFrame, right_title: str, right_df: pd.DataFrame) -> int:
+        last_left  = _write_table_at(start_row, 1, left_title,  left_df)
+        last_right = _write_table_at(start_row, 4, right_title, right_df)
+        return max(last_left, last_right) + 2  # leave a blank row after the pair
 
     r = row_cursor
-    r = _write_table(r, "Home Services — Top 5 by Current Balance", summaries["Home Services"]["top_by_current_balance"])
-    r = _write_table(r, "Home Services — Top 5 by Net Change", summaries["Home Services"]["top_by_net_change"])
-    r = _write_table(r, "Brands & Retail — Top 5 by Current Balance", summaries["Brands & Retail"]["top_by_current_balance"])
-    _ = _write_table(r, "Brands & Retail — Top 5 by Net Change", summaries["Brands & Retail"]["top_by_net_change"])
-
+    # Home Services
+    r = _write_pair(
+        r,
+        "Home Services — Top 5 by Current Balance",
+        summaries["Home Services"]["top_by_current_balance"],
+        "Home Services — Bottom 5 by Current Balance",
+        summaries["Home Services"]["bottom_by_current_balance"],
+    )
+    r = _write_pair(
+        r,
+        "Home Services — Top 5 by Net Change",
+        summaries["Home Services"]["top_by_net_change"],
+        "Home Services — Bottom 5 by Net Change",
+        summaries["Home Services"]["bottom_by_net_change"],
+    )
+    # Brands & Retail
+    r = _write_pair(
+        r,
+        "Brands & Retail — Top 5 by Current Balance",
+        summaries["Brands & Retail"]["top_by_current_balance"],
+        "Brands & Retail — Bottom 5 by Current Balance",
+        summaries["Brands & Retail"]["bottom_by_current_balance"],
+    )
+    _ = _write_pair(
+        r,
+        "Brands & Retail — Top 5 by Net Change",
+        summaries["Brands & Retail"]["top_by_net_change"],
+        "Brands & Retail — Bottom 5 by Net Change",
+        summaries["Brands & Retail"]["bottom_by_net_change"],
+    )
 
 
 if __name__ == "__main__":
@@ -725,50 +1117,71 @@ if __name__ == "__main__":
     VENDOR_DIR = (
         r"C:\Users\tbingha\Transform HoldCo LLC\Finance AI - Documents\Project docs\AP Financial Controls\Vendor Payable WeekXX - Prepare - Ali Mohdumair\Vendor Payable Report - DO NOT MODIFY\Vendor Payable Report.xlsx"
     )
-    # 2.3 Inclusive start of aggregation window (YYYY-MM-DD).
+    # Weekly window
     START_DATE = "2025-08-11"
-    # 2.4 Inclusive end of aggregation window (YYYY-MM-DD).
-    END_DATE = "2025-08-17"
+    END_DATE   = "2025-08-17"
+    # Daily target (the individual date you want to post)
+    DAILY_DATE = "2025-08-18"  # <-- set this to the desired day
 
     # --- 3. Load latest AP Analysis ---
     df_ap_analysis_raw, ap_path = load_latest_ap_analysis(AP_DIR)
     print(f"Loaded AP Analysis file: {ap_path.name}  shape={df_ap_analysis_raw.shape}")
 
-    # --- 4. Apply filters to AP Analysis data ---
+    # --- 4. Apply filters ---
     df_ap_analysis_report = filter_ap_analysis(df_ap_analysis_raw)
     print(f"After filters: {len(df_ap_analysis_report):,} rows (from {len(df_ap_analysis_raw):,})")
 
-    # --- 5. (Optional) Export for testing ---
-    # 5.1 Uncomment to write a CSV snapshot.
-    df_ap_analysis_report.to_csv("df_ap_analysis_report.csv", index=False)
+    # --- 5. (Optional) export ---
+    # df_ap_analysis_report.to_csv("df_ap_analysis_report.csv", index=False)
 
-    # --- 6. Aggregate vendor data for date window ---
+    # --- 6a. Weekly aggregate ---
     df_aggregate_vendor_data = aggregate_vendor_data_by_date(
         df_ap_analysis_report, start_date=START_DATE, end_date=END_DATE
     )
     print(df_aggregate_vendor_data.head())
-    # 6.1 Uncomment to write a CSV snapshot.
-    df_aggregate_vendor_data.to_csv("df_aggregate_vendor_data.csv", index=False)
+    # df_aggregate_vendor_data.to_csv("df_aggregate_vendor_data.csv", index=False)
 
-    # --- 7. Open Vendor Payable workbook (WRITE mode) ---
+    # --- 6b. Daily aggregate (start=end=DAILY_DATE) ---
+    df_aggregate_vendor_data_daily = aggregate_vendor_data_by_date(
+        df_ap_analysis_report, start_date=DAILY_DATE, end_date=DAILY_DATE
+    )
+
+    df_aggregate_vendor_data_daily.to_csv(
+    f"df_aggregate_vendor_data_daily_{pd.to_datetime(DAILY_DATE).date().isoformat()}.csv",
+    index=False, float_format="%.2f"
+    )
+
+    # --- 7. Open workbook (WRITE mode) ---
     xl_vendor_payable_report = load_vendor_payable_workbook(
         VENDOR_DIR, read_only=False, data_only=True
     )
     print("Sheets:", xl_vendor_payable_report.sheetnames)
 
-    # --- 8. Insert aggregates into 'Listings' and update Net Change ---
+    # --- 8. Weekly: insert into 'Listings' ---
     new_period_header, n_rows = insert_aggregate_into_listings(
         xl_vendor_payable_report, df_aggregate_vendor_data, sheet_name="Listings"
     )
-    print(f"Inserted columns through '{new_period_header}'. Updated {n_rows} rows.")
+    print(f"[Weekly] Inserted columns through '{new_period_header}'. Updated {n_rows} rows.")
 
-    # --- 9. Extend the Totals rows (Home Services & Brands & Retail) ---
+    # --- 9. Weekly totals ---
     hs_row, br_row, num_cols = extend_totals_rows(
         xl_vendor_payable_report, sheet_name="Listings"
     )
-    print(f"Extended totals rows (HS row {hs_row}, BR row {br_row}) across {num_cols} columns.")
+    print(f"[Weekly] Extended totals rows (HS row {hs_row}, BR row {br_row}) across {num_cols} columns.")
 
-    # --- 9b. Build and write summary tables (from Listings only) ---
+    # --- 10. Daily: insert into 'Daily Listings' ---
+    new_date_header, n_rows_daily = insert_daily_aggregate_into_daily_listings(
+        xl_vendor_payable_report, df_aggregate_vendor_data_daily, DAILY_DATE, sheet_name="Daily Listings"
+    )
+    print(f"[Daily] Inserted columns through '{new_date_header}'. Updated {n_rows_daily} rows.")
+
+    # --- 11. Daily totals ---
+    hs_row_d, br_row_d, num_cols_d = extend_totals_rows(
+        xl_vendor_payable_report, sheet_name="Daily Listings"
+    )
+    print(f"[Daily] Extended totals rows (HS row {hs_row_d}, BR row {br_row_d}) across {num_cols_d} columns.")
+
+    # --- 12. Weekly summary (unchanged) ---
     summaries = create_summary_dataframes_from_listings(
         xl_vendor_payable_report, sheet_name="Listings", top_n=5
     )
@@ -779,13 +1192,27 @@ if __name__ == "__main__":
         start_date=START_DATE,
         end_date=END_DATE,
     )
-    print("Wrote Summary sheet with top-5 tables for both divisions.")
+    print("Wrote Weekly Summary sheet with top-5 tables for both divisions.")
 
-    # --- 10. Save & close workbook ---
+    # --- 12b. Daily summary (from Daily Listings) ---
+    daily_summaries = create_daily_summary_dataframes_from_daily_listings(
+        xl_vendor_payable_report, sheet_name="Daily Listings", top_n=5
+    )
+    write_summaries_to_sheet(
+        xl_vendor_payable_report,
+        daily_summaries,
+        sheet_name="Daily Summary",
+        start_date=DAILY_DATE,
+        end_date=DAILY_DATE,   # ok to pass same date; banner still shows range
+    )
+    print("Wrote Daily Summary sheet with top-5 tables for both divisions.")
+
+    # --- 13. Save & close ---
     xl_vendor_payable_report.save(VENDOR_DIR)
     xl_vendor_payable_report.close()
     print("Saved and closed workbook.")
 
-    # --- 11. Report elapsed time ---
+    # --- 14. Report elapsed time ---
     t1 = time.perf_counter()
     print(f"Done in {t1 - t0:.2f}s")
+
