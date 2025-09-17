@@ -14,10 +14,10 @@ It supports:
 
 Most people can just run:
 ```bash
-python your_script.py
+python update_vendor_payable_report.py
 ```
 - Uses **auto dates** (see below) and runs **both** weekly and daily.
-- On **non‑Mondays**, the **weekly** portion is **skipped by default** (Monday gate). Add `--force-weekly` to run it anyway.
+- On **non-Mondays**, the **weekly** portion is **skipped by default** (Monday gate). Add `--force-weekly` to run it anyway.
 
 ---
 
@@ -34,22 +34,22 @@ Example: If today is **Monday 9/15/2025**, then
 
 Run with explicit auto flag or just omit manual args:
 ```bash
-python your_script.py --auto-dates
+python update_vendor_payable_report.py --auto-dates
 # or simply
-python your_script.py
+python update_vendor_payable_report.py
 ```
 
 Specify a timezone (IANA name) if needed:
 ```bash
-python your_script.py --auto-dates --tz America/Chicago
+python update_vendor_payable_report.py --auto-dates --tz America/Chicago
 ```
 
 ### Manual dates
 Provide all three:
 ```bash
-python your_script.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15
+python update_vendor_payable_report.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15
 # Manual mode is also implied if you supply any of --start/--end/--daily:
-python your_script.py --start 9/7/2025 --end 9/13/2025 --daily 9/15/2025
+python update_vendor_payable_report.py --start 9/7/2025 --end 9/13/2025 --daily 9/15/2025
 ```
 Accepted formats: `YYYY-MM-DD`, `M/D/YYYY`. Validation ensures `start ≤ end`.
 
@@ -59,21 +59,21 @@ Accepted formats: `YYYY-MM-DD`, `M/D/YYYY`. Validation ensures `start ≤ end`.
 
 - Run **both** (default): do weekly *and* daily
   ```bash
-  python your_script.py
+  python update_vendor_payable_report.py
   ```
 
 - **Weekly only**:
   ```bash
-  python your_script.py --only-weekly
+  python update_vendor_payable_report.py --only-weekly
   # with auto dates explicitly:
-  python your_script.py --auto-dates --only-weekly
+  python update_vendor_payable_report.py --auto-dates --only-weekly
   ```
 
 - **Daily only**:
   ```bash
-  python your_script.py --only-daily
+  python update_vendor_payable_report.py --only-daily
   # with manual dates:
-  python your_script.py --start 9/15/2025 --end 9/15/2025 --daily 9/15/2025 --only-daily
+  python update_vendor_payable_report.py --start 9/15/2025 --end 9/15/2025 --daily 9/15/2025 --only-daily
   ```
 
 ---
@@ -86,17 +86,17 @@ Accepted formats: `YYYY-MM-DD`, `M/D/YYYY`. Validation ensures `start ≤ end`.
 
 Examples:
 ```bash
-# Non‑Monday, run both: weekly is skipped automatically; daily still runs
-python your_script.py
+# Non-Monday, run both: weekly is skipped automatically; daily still runs
+python update_vendor_payable_report.py
 
-# Non‑Monday, force weekly to run anyway
-python your_script.py --force-weekly
+# Non-Monday, force weekly to run anyway
+python update_vendor_payable_report.py --force-weekly
 
 # Monday, but you want daily only
-python your_script.py --only-daily
+python update_vendor_payable_report.py --only-daily
 
-# Weekly only on a non‑Monday (forced)
-python your_script.py --only-weekly --force-weekly
+# Weekly only on a non-Monday (forced)
+python update_vendor_payable_report.py --only-weekly --force-weekly
 ```
 
 ---
@@ -130,34 +130,34 @@ VENDOR_DIR = r"C:\Users\tbingha\Transform HoldCo LLC\Finance AI - Documents\Proj
 
 **Auto dates, both weekly & daily (default):**
 ```bash
-python your_script.py
+python update_vendor_payable_report.py
 ```
 
 **Auto dates, weekly only (Monday required unless forced):**
 ```bash
-python your_script.py --only-weekly
-# force on non‑Monday:
-python your_script.py --only-weekly --force-weekly
+python update_vendor_payable_report.py --only-weekly
+# force on non-Monday:
+python update_vendor_payable_report.py --only-weekly --force-weekly
 ```
 
 **Auto dates, daily only (today):**
 ```bash
-python your_script.py --only-daily
+python update_vendor_payable_report.py --only-daily
 ```
 
 **Manual dates, both:**
 ```bash
-python your_script.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15
+python update_vendor_payable_report.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15
 ```
 
 **Manual dates, weekly only (force if not Monday):**
 ```bash
-python your_script.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15 --only-weekly --force-weekly
+python update_vendor_payable_report.py --manual-dates --start 2025-09-07 --end 2025-09-13 --daily 2025-09-15 --only-weekly --force-weekly
 ```
 
 **Auto with a different timezone:**
 ```bash
-python your_script.py --auto-dates --tz America/Chicago
+python update_vendor_payable_report.py --auto-dates --tz America/Chicago
 ```
 
 ---
@@ -166,7 +166,7 @@ python your_script.py --auto-dates --tz America/Chicago
 
 Create **`.vscode/launch.json`** with one or more entries, e.g.:
 
-**Auto dates, weekly only (force on non‑Monday):**
+**Auto dates, weekly only (force on non-Monday):**
 ```json
 {
   "version": "0.2.0",
@@ -175,7 +175,7 @@ Create **`.vscode/launch.json`** with one or more entries, e.g.:
       "name": "AP Inserter (auto, weekly only, forced)",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/your_script.py",
+      "program": "${workspaceFolder}/update_vendor_payable_report.py",
       "console": "integratedTerminal",
       "args": ["--auto-dates", "--only-weekly", "--force-weekly"]
     }
@@ -192,7 +192,7 @@ Create **`.vscode/launch.json`** with one or more entries, e.g.:
       "name": "AP Inserter (manual, daily only)",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/your_script.py",
+      "program": "${workspaceFolder}/update_vendor_payable_report.py",
       "console": "integratedTerminal",
       "args": [
         "--manual-dates",
