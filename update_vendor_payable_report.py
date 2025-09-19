@@ -1129,7 +1129,6 @@ def _compute_auto_dates(tz: str = "America/New_York") -> tuple[str, str, str]:
         daily.isoformat(),
     )
 
-
 def _parse_cli() -> tuple[str, str, str, bool, bool]:
     """
     Parse CLI for dates and run mode, and apply the Monday gate for weekly runs.
@@ -1211,7 +1210,6 @@ def _parse_cli() -> tuple[str, str, str, bool, bool]:
         run_weekly = False
 
     return start_iso, end_iso, daily_iso, run_weekly, run_daily
-
 
 
 if __name__ == "__main__":
