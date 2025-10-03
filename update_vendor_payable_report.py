@@ -1219,7 +1219,7 @@ if __name__ == "__main__":
     # --- 2. Configure input paths and dates ---
     AP_DIR = r"\\SHSNGSTFSX\shs_boomi_vol\Test\AP_Report_Files"
     VENDOR_DIR = (
-        r"C:\Users\tbingha\Transform HoldCo LLC\Finance AI - Documents\Project docs\AP Financial Controls\Vendor Payable WeekXX - Prepare - Ali Mohdumair\Vendor Payable Report - DO NOT MODIFY\Vendor Payable Report.xlsx"
+        r"C:\Users\tbingha\Transform HoldCo LLC\Finance AI - Documents\Project docs\Financial Controls_Reporting\Vendor Payable WeekXX - Prepare - Ali Mohdumair\Vendor Payable Report - DO NOT MODIFY\Vendor Payable Report.xlsx"
     )
 
     START_DATE, END_DATE, DAILY_DATE, RUN_WEEKLY, RUN_DAILY = _parse_cli()
